@@ -46,7 +46,7 @@ Tunnels are stored in `config.json`:
       "local_port": "33306",
       "remote_host": "localhost",
       "remote_port": "13306",
-      "ssh_host": "155.248.183.71",
+      "ssh_host": "123.456.789.0",
       "ssh_port": "22",
       "ssh_user": "ubuntu",
       "ssh_key": "/path/to/key.pem",
