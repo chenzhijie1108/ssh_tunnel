@@ -11,17 +11,19 @@ type Config struct {
 }
 
 type TunnelConfig struct {
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	LocalPort  string `json:"local_port"`
-	RemoteHost string `json:"remote_host"`
-	RemotePort string `json:"remote_port"`
-	SshHost    string `json:"ssh_host"`
-	SshPort    string `json:"ssh_port"`
-	SshUser    string `json:"ssh_user"`
-	SshKey     string `json:"ssh_key"`
-	SshPass    string `json:"ssh_pass"`
-	CreatedAt  int64  `json:"created_at"`
+	Name           string `json:"name"`
+	Type           string `json:"type"`
+	LocalPort      string `json:"local_port"`
+	RemoteHost     string `json:"remote_host"`
+	RemotePort     string `json:"remote_port"`
+	SshHost        string `json:"ssh_host"`
+	SshPort        string `json:"ssh_port"`
+	SshUser        string `json:"ssh_user"`
+	SshKey         string `json:"ssh_key"`
+	SshPass        string `json:"ssh_pass"`
+	CreatedAt      int64  `json:"created_at"`
+	AutoReconnect  bool   `json:"auto_reconnect"`
+	ReconnectDelay int    `json:"reconnect_delay"`
 }
 
 const configFile = "config.json"
@@ -49,19 +51,21 @@ func loadConfig() error {
 			createdAt = time.Now().Unix()
 		}
 		tunnels[t.Name] = &Tunnel{
-			ID:         t.Name,
-			Name:       t.Name,
-			Type:       t.Type,
-			LocalPort:  t.LocalPort,
-			RemoteHost: t.RemoteHost,
-			RemotePort: t.RemotePort,
-			SshHost:    t.SshHost,
-			SshPort:    t.SshPort,
-			SshUser:    t.SshUser,
-			SshKey:     t.SshKey,
-			SshPass:    t.SshPass,
-			Status:     "stopped",
-			CreatedAt:  createdAt,
+			ID:             t.Name,
+			Name:           t.Name,
+			Type:           t.Type,
+			LocalPort:      t.LocalPort,
+			RemoteHost:     t.RemoteHost,
+			RemotePort:     t.RemotePort,
+			SshHost:        t.SshHost,
+			SshPort:        t.SshPort,
+			SshUser:        t.SshUser,
+			SshKey:         t.SshKey,
+			SshPass:        t.SshPass,
+			Status:         "stopped",
+			CreatedAt:      createdAt,
+			AutoReconnect:  t.AutoReconnect,
+			ReconnectDelay: t.ReconnectDelay,
 		}
 	}
 
@@ -78,17 +82,19 @@ func saveConfig() error {
 
 	for _, t := range tunnels {
 		cfg.Tunnels = append(cfg.Tunnels, TunnelConfig{
-			Name:       t.Name,
-			Type:       t.Type,
-			LocalPort:  t.LocalPort,
-			RemoteHost: t.RemoteHost,
-			RemotePort: t.RemotePort,
-			SshHost:    t.SshHost,
-			SshPort:    t.SshPort,
-			SshUser:    t.SshUser,
-			SshKey:     t.SshKey,
-			SshPass:    t.SshPass,
-			CreatedAt:  t.CreatedAt,
+			Name:           t.Name,
+			Type:           t.Type,
+			LocalPort:      t.LocalPort,
+			RemoteHost:     t.RemoteHost,
+			RemotePort:     t.RemotePort,
+			SshHost:        t.SshHost,
+			SshPort:        t.SshPort,
+			SshUser:        t.SshUser,
+			SshKey:         t.SshKey,
+			SshPass:        t.SshPass,
+			CreatedAt:      t.CreatedAt,
+			AutoReconnect:  t.AutoReconnect,
+			ReconnectDelay: t.ReconnectDelay,
 		})
 	}
 

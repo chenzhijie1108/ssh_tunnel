@@ -162,6 +162,8 @@ const HOME_HTML = `<!DOCTYPE html>
             background: white; color: var(--text-main); width: 100%;
         }
         input:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1); }
+        input[type="checkbox"] { width: auto; margin-right: 0.5rem; cursor: pointer; }
+        .checkbox-label { display: flex; align-items: center; cursor: pointer; }
         .help-text { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; }
 
         /* Toast */
@@ -281,6 +283,22 @@ const HOME_HTML = `<!DOCTYPE html>
                             </div>
                         </div>
                     </div>
+
+                    <div class="form-section">
+                        <div class="form-section-title">高级设置</div>
+                        <div class="form-grid">
+                            <div class="form-group full-width">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" name="auto_reconnect" id="add_auto_reconnect">
+                                    <span>断线后自动重连</span>
+                                </label>
+                            </div>
+                            <div class="form-group" id="add_reconnect_delay_group" style="display: none;">
+                                <label>重连延迟 (秒)</label>
+                                <input type="number" name="reconnect_delay" id="add_reconnect_delay" placeholder="5" value="5" min="1" max="60">
+                            </div>
+                        </div>
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" onclick="hideAddModal()">取消</button>
@@ -370,6 +388,22 @@ const HOME_HTML = `<!DOCTYPE html>
                                 <label>SSH 密钥路径 (可选)</label>
                                 <input type="text" name="ssh_key" placeholder="例如: ~/.ssh/id_rsa">
                                 <div class="help-text">如果配置了密码，密钥将被优先使用。</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <div class="form-section-title">高级设置</div>
+                        <div class="form-grid">
+                            <div class="form-group full-width">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" name="auto_reconnect" id="edit_auto_reconnect">
+                                    <span>断线后自动重连</span>
+                                </label>
+                            </div>
+                            <div class="form-group" id="edit_reconnect_delay_group" style="display: none;">
+                                <label>重连延迟 (秒)</label>
+                                <input type="number" name="reconnect_delay" id="edit_reconnect_delay" placeholder="5" value="5" min="1" max="60">
                             </div>
                         </div>
                     </div>
@@ -597,6 +631,9 @@ const HOME_HTML = `<!DOCTYPE html>
             form.ssh_user.value = tunnel.ssh_user || '';
             form.ssh_pass.value = '';
             form.ssh_key.value = tunnel.ssh_key || '';
+            form.auto_reconnect.checked = tunnel.auto_reconnect || false;
+            form.reconnect_delay.value = tunnel.reconnect_delay || 5;
+            toggleReconnectDelay('edit');
 
             document.getElementById('editModal').classList.add('active');
         }
@@ -605,7 +642,23 @@ const HOME_HTML = `<!DOCTYPE html>
             tunnelToEdit = null;
             document.getElementById('editModal').classList.remove('active');
             document.getElementById('editForm').reset();
+            document.getElementById('edit_reconnect_delay_group').style.display = 'none';
         }
+
+        function toggleReconnectDelay(formPrefix) {
+            const checkbox = document.getElementById(formPrefix + '_auto_reconnect');
+            const delayGroup = document.getElementById(formPrefix + '_reconnect_delay_group');
+            if (checkbox && delayGroup) {
+                delayGroup.style.display = checkbox.checked ? 'block' : 'none';
+            }
+        }
+
+        document.getElementById('add_auto_reconnect').addEventListener('change', function() {
+            toggleReconnectDelay('add');
+        });
+        document.getElementById('edit_auto_reconnect').addEventListener('change', function() {
+            toggleReconnectDelay('edit');
+        });
 
         // --- Actions ---
         document.getElementById('addForm').onsubmit = async (e) => {
@@ -627,7 +680,9 @@ const HOME_HTML = `<!DOCTYPE html>
                 ssh_port: form.ssh_port.value || '22',
                 ssh_user: form.ssh_user.value,
                 ssh_key: form.ssh_key.value,
-                ssh_pass: form.ssh_pass.value
+                ssh_pass: form.ssh_pass.value,
+                auto_reconnect: form.auto_reconnect.checked,
+                reconnect_delay: parseInt(form.reconnect_delay.value) || 5
             };
 
             try {
@@ -673,7 +728,9 @@ const HOME_HTML = `<!DOCTYPE html>
                 ssh_port: form.ssh_port.value || '22',
                 ssh_user: form.ssh_user.value,
                 ssh_key: form.ssh_key.value,
-                ssh_pass: form.ssh_pass.value
+                ssh_pass: form.ssh_pass.value,
+                auto_reconnect: form.auto_reconnect.checked,
+                reconnect_delay: parseInt(form.reconnect_delay.value) || 5
             };
 
             try {
