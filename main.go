@@ -3,10 +3,12 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -48,6 +50,10 @@ var (
 const (
 	defaultReconnectDelay     = 5
 	defaultMaxReconnectPerMin = 5
+	maxReconnectDelay         = 60
+	jitterRange               = 5
+	defaultReadyTimeout       = 30
+	remoteStableDurationSec   = 3
 )
 
 func main() {
@@ -165,6 +171,66 @@ func waitForPortOpen(port string, timeout time.Duration) bool {
 	return false
 }
 
+func getKnownHostsPath() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		if runtime.GOOS == "windows" {
+			return os.Getenv("USERPROFILE") + "\\.ssh\\known_hosts"
+		}
+		return os.Getenv("HOME") + "/.ssh/known_hosts"
+	}
+	return filepath.Join(homeDir, ".ssh", "known_hosts")
+}
+
+func getBaseReconnectDelay(tunnel *Tunnel) int {
+	if tunnel != nil && tunnel.ReconnectDelay > 0 {
+		if tunnel.ReconnectDelay > maxReconnectDelay {
+			return maxReconnectDelay
+		}
+		return tunnel.ReconnectDelay
+	}
+	return defaultReconnectDelay
+}
+
+func isValidPort(port string) bool {
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return false
+	}
+	return p >= 1 && p <= 65535
+}
+
+func waitForTunnelReady(tunnel *Tunnel, cmd *exec.Cmd, timeout time.Duration) bool {
+	if tunnel.Type == "local" {
+		return waitForPortOpen(tunnel.LocalPort, timeout)
+	}
+
+	if cmd == nil || cmd.Process == nil {
+		return false
+	}
+
+	pid := cmd.Process.Pid
+	deadline := time.Now().Add(timeout)
+	stableDuration := time.Duration(remoteStableDurationSec) * time.Second
+	stableSince := time.Time{}
+
+	for time.Now().Before(deadline) {
+		if !processExists(pid) {
+			return false
+		}
+
+		if stableSince.IsZero() {
+			stableSince = time.Now()
+		} else if time.Since(stableSince) >= stableDuration {
+			return true
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return false
+}
+
 func listTunnelsHandler(w http.ResponseWriter, r *http.Request) {
 	tunnelMux.RLock()
 	defer tunnelMux.RUnlock()
@@ -215,10 +281,30 @@ func createTunnelHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.RemoteHost == "" {
+		req.RemoteHost = "localhost"
+	}
+
 	if req.SshKey == "" && req.SshPass == "" {
 		log.Printf("[WARN] Create tunnel failed: no SSH credentials provided for '%s'", req.Name)
 		sendError(w, "Must provide SSH key path or password", 400)
 		return
+	}
+
+	if !isValidPort(req.LocalPort) || !isValidPort(req.RemotePort) {
+		log.Printf("[WARN] Create tunnel failed: invalid local/remote port for '%s'", req.Name)
+		sendError(w, "Port must be between 1 and 65535", 400)
+		return
+	}
+
+	if req.SshPort != "" && !isValidPort(req.SshPort) {
+		log.Printf("[WARN] Create tunnel failed: invalid ssh_port for '%s'", req.Name)
+		sendError(w, "SSH port must be between 1 and 65535", 400)
+		return
+	}
+
+	if req.ReconnectDelay <= 0 {
+		req.ReconnectDelay = defaultReconnectDelay
 	}
 
 	tunnelMux.Lock()
@@ -300,6 +386,24 @@ func updateTunnelHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.RemoteHost == "" {
+		req.RemoteHost = "localhost"
+	}
+
+	if !isValidPort(req.LocalPort) || !isValidPort(req.RemotePort) {
+		sendError(w, "Port must be between 1 and 65535", 400)
+		return
+	}
+
+	if req.SshPort != "" && !isValidPort(req.SshPort) {
+		sendError(w, "SSH port must be between 1 and 65535", 400)
+		return
+	}
+
+	if req.ReconnectDelay <= 0 {
+		req.ReconnectDelay = defaultReconnectDelay
+	}
+
 	tunnelMux.Lock()
 	tunnel, ok := tunnels[id]
 	if !ok {
@@ -311,6 +415,16 @@ func updateTunnelHandler(w http.ResponseWriter, r *http.Request) {
 	if tunnel.Status == "running" {
 		tunnelMux.Unlock()
 		sendError(w, "Cannot edit a running tunnel, stop it first", 400)
+		return
+	}
+
+	effectivePass := req.SshPass
+	if effectivePass == "" {
+		effectivePass = tunnel.SshPass
+	}
+	if req.SshKey == "" && effectivePass == "" {
+		tunnelMux.Unlock()
+		sendError(w, "Must provide SSH key path or password", 400)
 		return
 	}
 
@@ -327,7 +441,9 @@ func updateTunnelHandler(w http.ResponseWriter, r *http.Request) {
 	tunnel.SshPort = req.SshPort
 	tunnel.SshUser = req.SshUser
 	tunnel.SshKey = req.SshKey
-	tunnel.SshPass = req.SshPass
+	if req.SshPass != "" {
+		tunnel.SshPass = req.SshPass
+	}
 	tunnel.AutoReconnect = req.AutoReconnect
 	tunnel.ReconnectDelay = req.ReconnectDelay
 
@@ -390,18 +506,9 @@ func startTunnelHandler(w http.ResponseWriter, r *http.Request) {
 
 	const maxRetries = 3
 	const retryDelay = 5
-	const readyTimeout = 30
 
 	var args []string
-	knownHostsFile := os.Getenv("USERPROFILE") + "/.ssh/known_hosts"
-	if runtime.GOOS == "windows" {
-		knownHostsFile = os.Getenv("USERPROFILE") + "\\.ssh\\known_hosts"
-	}
-
-	localPort := tunnel.LocalPort
-	if tunnel.Type == "remote" {
-		localPort = tunnel.RemotePort
-	}
+	knownHostsFile := getKnownHostsPath()
 
 	if tunnel.Type == "local" {
 		sshPort := "22"
@@ -411,11 +518,12 @@ func startTunnelHandler(w http.ResponseWriter, r *http.Request) {
 		args = []string{
 			"-N", "-L", fmt.Sprintf("%s:%s:%s", tunnel.LocalPort, tunnel.RemoteHost, tunnel.RemotePort),
 			"-p", sshPort,
-			"-o", "ServerAliveInterval=30",
-			"-o", "ServerAliveCountMax=3",
+			"-o", "ServerAliveInterval=15",
+			"-o", "ServerAliveCountMax=5",
 			"-o", "TCPKeepAlive=yes",
 			"-o", "StrictHostKeyChecking=accept-new",
 			"-o", "UserKnownHostsFile=" + knownHostsFile,
+			"-o", "ConnectTimeout=10",
 		}
 	} else {
 		sshPort := "22"
@@ -423,13 +531,14 @@ func startTunnelHandler(w http.ResponseWriter, r *http.Request) {
 			sshPort = tunnel.SshPort
 		}
 		args = []string{
-			"-N", "-R", fmt.Sprintf("%s:%s:%s", tunnel.RemotePort, tunnel.LocalPort, tunnel.LocalPort),
+			"-N", "-R", fmt.Sprintf("%s:%s:%s", tunnel.RemotePort, tunnel.RemoteHost, tunnel.LocalPort),
 			"-p", sshPort,
-			"-o", "ServerAliveInterval=30",
-			"-o", "ServerAliveCountMax=3",
+			"-o", "ServerAliveInterval=15",
+			"-o", "ServerAliveCountMax=5",
 			"-o", "TCPKeepAlive=yes",
 			"-o", "StrictHostKeyChecking=accept-new",
 			"-o", "UserKnownHostsFile=" + knownHostsFile,
+			"-o", "ConnectTimeout=10",
 		}
 	}
 
@@ -441,6 +550,7 @@ func startTunnelHandler(w http.ResponseWriter, r *http.Request) {
 
 	var cmd *exec.Cmd
 	var startErr error
+	started := false
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		cmd = exec.Command("ssh", args...)
@@ -467,17 +577,27 @@ func startTunnelHandler(w http.ResponseWriter, r *http.Request) {
 		tunnel.Status = "starting"
 		tunnelMux.Unlock()
 
-		log.Printf("[INFO] Tunnel '%s' starting, waiting for port %s to be ready...", tunnel.Name, localPort)
+		if tunnel.Type == "local" {
+			log.Printf("[INFO] Tunnel '%s' starting, waiting for local port %s to be ready...", tunnel.Name, tunnel.LocalPort)
+		} else {
+			log.Printf("[INFO] Tunnel '%s' starting, waiting for process to stabilize...", tunnel.Name)
+		}
 
-		if waitForPortOpen(localPort, time.Duration(readyTimeout)*time.Second) {
+		if waitForTunnelReady(tunnel, cmd, time.Duration(defaultReadyTimeout)*time.Second) {
 			tunnelMux.Lock()
 			tunnel.Status = "running"
+			tunnel.ReconnectAttempts = 0
 			tunnelMux.Unlock()
-			log.Printf("[INFO] Tunnel ready: %s (PID: %d, port: %s)", tunnel.Name, cmd.Process.Pid, localPort)
+			if tunnel.Type == "local" {
+				log.Printf("[INFO] Tunnel ready: %s (PID: %d, port: %s)", tunnel.Name, cmd.Process.Pid, tunnel.LocalPort)
+			} else {
+				log.Printf("[INFO] Tunnel ready: %s (PID: %d)", tunnel.Name, cmd.Process.Pid)
+			}
+			started = true
 			break
 		}
 
-		log.Printf("[WARN] Tunnel '%s' port not ready after %d seconds, killing process...", tunnel.Name, readyTimeout)
+		log.Printf("[WARN] Tunnel '%s' not ready after %d seconds, killing process...", tunnel.Name, defaultReadyTimeout)
 		cmd.Process.Kill()
 		cmd.Wait()
 
@@ -493,7 +613,7 @@ func startTunnelHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if tunnel.Status != "running" {
+	if !started {
 		log.Printf("[ERROR] Start tunnel failed after %d attempts: %s", maxRetries, tunnel.Name)
 		sendError(w, fmt.Sprintf("Failed to start tunnel '%s' after %d attempts", tunnel.Name, maxRetries), 500)
 		return
@@ -514,10 +634,6 @@ func startTunnelHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if wasRunning && tunnel.AutoReconnect {
-			delay := tunnel.ReconnectDelay
-			if delay <= 0 {
-				delay = defaultReconnectDelay
-			}
 			maxAttempts := tunnel.MaxReconnectAttempts
 			if maxAttempts <= 0 {
 				maxAttempts = defaultMaxReconnectPerMin
@@ -530,8 +646,18 @@ func startTunnelHandler(w http.ResponseWriter, r *http.Request) {
 			tunnelMux.Unlock()
 
 			if shouldReconnect {
-				log.Printf("[INFO] Auto-reconnecting tunnel '%s' in %d seconds (attempt %d/%d)",
-					tunnel.Name, delay, tunnel.ReconnectAttempts, maxAttempts)
+				baseDelay := getBaseReconnectDelay(tunnel)
+				backoffDelay := baseDelay * (1 << (tunnel.ReconnectAttempts - 1))
+				if backoffDelay > maxReconnectDelay {
+					backoffDelay = maxReconnectDelay
+				}
+				jitter := rand.Intn(jitterRange*2) - jitterRange
+				delay := backoffDelay + jitter
+				if delay < 1 {
+					delay = 1
+				}
+				log.Printf("[INFO] Auto-reconnecting tunnel '%s' in %d seconds (attempt %d/%d, backoff=%ds)",
+					tunnel.Name, delay, tunnel.ReconnectAttempts, maxAttempts, backoffDelay)
 				time.Sleep(time.Duration(delay) * time.Second)
 				startTunnelAsync(tunnel)
 			} else {
@@ -670,18 +796,9 @@ func getWindowsProcessBytes(pid int) (int64, int64) {
 func startTunnelAsync(tunnel *Tunnel) {
 	const maxRetries = 3
 	const retryDelay = 5
-	const readyTimeout = 30
 
 	var args []string
-	knownHostsFile := os.Getenv("USERPROFILE") + "/.ssh/known_hosts"
-	if runtime.GOOS == "windows" {
-		knownHostsFile = os.Getenv("USERPROFILE") + "\\.ssh\\known_hosts"
-	}
-
-	localPort := tunnel.LocalPort
-	if tunnel.Type == "remote" {
-		localPort = tunnel.RemotePort
-	}
+	knownHostsFile := getKnownHostsPath()
 
 	if tunnel.Type == "local" {
 		sshPort := "22"
@@ -691,11 +808,12 @@ func startTunnelAsync(tunnel *Tunnel) {
 		args = []string{
 			"-N", "-L", fmt.Sprintf("%s:%s:%s", tunnel.LocalPort, tunnel.RemoteHost, tunnel.RemotePort),
 			"-p", sshPort,
-			"-o", "ServerAliveInterval=30",
-			"-o", "ServerAliveCountMax=3",
+			"-o", "ServerAliveInterval=15",
+			"-o", "ServerAliveCountMax=5",
 			"-o", "TCPKeepAlive=yes",
 			"-o", "StrictHostKeyChecking=accept-new",
 			"-o", "UserKnownHostsFile=" + knownHostsFile,
+			"-o", "ConnectTimeout=10",
 		}
 	} else {
 		sshPort := "22"
@@ -703,13 +821,14 @@ func startTunnelAsync(tunnel *Tunnel) {
 			sshPort = tunnel.SshPort
 		}
 		args = []string{
-			"-N", "-R", fmt.Sprintf("%s:%s:%s", tunnel.RemotePort, tunnel.LocalPort, tunnel.LocalPort),
+			"-N", "-R", fmt.Sprintf("%s:%s:%s", tunnel.RemotePort, tunnel.RemoteHost, tunnel.LocalPort),
 			"-p", sshPort,
-			"-o", "ServerAliveInterval=30",
-			"-o", "ServerAliveCountMax=3",
+			"-o", "ServerAliveInterval=15",
+			"-o", "ServerAliveCountMax=5",
 			"-o", "TCPKeepAlive=yes",
 			"-o", "StrictHostKeyChecking=accept-new",
 			"-o", "UserKnownHostsFile=" + knownHostsFile,
+			"-o", "ConnectTimeout=10",
 		}
 	}
 
@@ -721,6 +840,7 @@ func startTunnelAsync(tunnel *Tunnel) {
 
 	var cmd *exec.Cmd
 	var startErr error
+	started := false
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		cmd = exec.Command("ssh", args...)
@@ -747,18 +867,27 @@ func startTunnelAsync(tunnel *Tunnel) {
 		tunnel.Status = "starting"
 		tunnelMux.Unlock()
 
-		log.Printf("[INFO] Tunnel '%s' starting, waiting for port %s to be ready...", tunnel.Name, localPort)
+		if tunnel.Type == "local" {
+			log.Printf("[INFO] Tunnel '%s' starting, waiting for local port %s to be ready...", tunnel.Name, tunnel.LocalPort)
+		} else {
+			log.Printf("[INFO] Tunnel '%s' starting, waiting for process to stabilize...", tunnel.Name)
+		}
 
-		if waitForPortOpen(localPort, time.Duration(readyTimeout)*time.Second) {
+		if waitForTunnelReady(tunnel, cmd, time.Duration(defaultReadyTimeout)*time.Second) {
 			tunnelMux.Lock()
 			tunnel.Status = "running"
 			tunnel.ReconnectAttempts = 0
 			tunnelMux.Unlock()
-			log.Printf("[INFO] Tunnel ready: %s (PID: %d, port: %s)", tunnel.Name, cmd.Process.Pid, localPort)
+			if tunnel.Type == "local" {
+				log.Printf("[INFO] Tunnel ready: %s (PID: %d, port: %s)", tunnel.Name, cmd.Process.Pid, tunnel.LocalPort)
+			} else {
+				log.Printf("[INFO] Tunnel ready: %s (PID: %d)", tunnel.Name, cmd.Process.Pid)
+			}
+			started = true
 			break
 		}
 
-		log.Printf("[WARN] Tunnel '%s' port not ready after %d seconds, killing process...", tunnel.Name, readyTimeout)
+		log.Printf("[WARN] Tunnel '%s' not ready after %d seconds, killing process...", tunnel.Name, defaultReadyTimeout)
 		cmd.Process.Kill()
 		cmd.Wait()
 
@@ -774,7 +903,7 @@ func startTunnelAsync(tunnel *Tunnel) {
 		}
 	}
 
-	if tunnel.Status != "running" {
+	if !started {
 		log.Printf("[ERROR] Start tunnel failed after %d attempts: %s", maxRetries, tunnel.Name)
 		return
 	}
@@ -794,10 +923,6 @@ func startTunnelAsync(tunnel *Tunnel) {
 		}
 
 		if wasRunning && tunnel.AutoReconnect {
-			delay := tunnel.ReconnectDelay
-			if delay <= 0 {
-				delay = defaultReconnectDelay
-			}
 			maxAttempts := tunnel.MaxReconnectAttempts
 			if maxAttempts <= 0 {
 				maxAttempts = defaultMaxReconnectPerMin
@@ -810,8 +935,18 @@ func startTunnelAsync(tunnel *Tunnel) {
 			tunnelMux.Unlock()
 
 			if shouldReconnect {
-				log.Printf("[INFO] Auto-reconnecting tunnel '%s' in %d seconds (attempt %d/%d)",
-					tunnel.Name, delay, tunnel.ReconnectAttempts, maxAttempts)
+				baseDelay := getBaseReconnectDelay(tunnel)
+				backoffDelay := baseDelay * (1 << (tunnel.ReconnectAttempts - 1))
+				if backoffDelay > maxReconnectDelay {
+					backoffDelay = maxReconnectDelay
+				}
+				jitter := rand.Intn(jitterRange*2) - jitterRange
+				delay := backoffDelay + jitter
+				if delay < 1 {
+					delay = 1
+				}
+				log.Printf("[INFO] Auto-reconnecting tunnel '%s' in %d seconds (attempt %d/%d, backoff=%ds)",
+					tunnel.Name, delay, tunnel.ReconnectAttempts, maxAttempts, backoffDelay)
 				time.Sleep(time.Duration(delay) * time.Second)
 				startTunnelAsync(tunnel)
 			} else {
